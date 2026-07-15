@@ -29,17 +29,16 @@ def analyze_slice(path: Path) -> Tuple[dict, dict]:
         "LoadStartHookOffset2": hex_addr(scene.address),
         "StructOffset": scene.struct_offset,
         "SceneOffset": scene.scene_offset,
+        "ResourceCachePolicyHookOffset": hex_addr(cache.address),
         "CDPFilterHookOffset": hex_addr(cdp.address),
     }
-    if cache is not None:
-        config["ResourceCachePolicyHookOffset"] = hex_addr(cache.address)
     report = {
         "path": str(path),
         "arch": image.arch,
         "load_start": load.__dict__,
         "scene_hook": scene.__dict__,
         "cdp_filter": cdp.__dict__,
-        "resource_cache_policy": cache.__dict__ if cache else {"omitted": True, "reason": "no high-confidence evidence"},
+        "resource_cache_policy": cache.__dict__,
     }
     return config, report
 

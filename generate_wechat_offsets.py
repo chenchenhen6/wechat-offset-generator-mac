@@ -79,8 +79,6 @@ def main(argv=None) -> int:
     if args.verbose:
         print(f"report: {report_path}")
         print(f"config: {config_path}")
-        if any("ResourceCachePolicyHookOffset" not in v for v in config["Arch"].values()):
-            print("warning: ResourceCachePolicyHookOffset omitted: no high-confidence evidence")
     return 0
 
 

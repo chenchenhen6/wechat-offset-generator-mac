@@ -1,4 +1,5 @@
 import re
+import struct
 from typing import Iterable, List, Optional, Tuple
 
 try:
@@ -32,7 +33,7 @@ class Disassembler:
         return list(self.md.disasm(data, start))
 
     def text_instructions(self):
-        sec, data = self.image.section_bytes("__TEXT", "__text")
+        sec, data = self.image.section_view("__TEXT", "__text")
         return self.md.disasm(data, sec.address)
 
     def looks_like_function_entry(self, address: int) -> bool:
@@ -70,20 +71,22 @@ class Disassembler:
 
     def find_previous_function_entry(self, address: int, max_back: int = 0x1000) -> Optional[int]:
         if self.image.arch == "x64":
-            text, data = self.image.section_bytes("__TEXT", "__text")
+            text = self.image.section("__TEXT", "__text")
             try:
                 off = address - text.address
             except Exception:
                 return None
-            if off < 0 or off > len(data):
+            if off < 0 or off > text.size:
                 return None
             lo = max(0, off - max_back)
-            rel = data[lo:off].rfind(b"\x55\x48\x89\xe5")
-            if rel >= 0:
-                return text.address + lo + rel
-            rel = data[lo:off].rfind(b"\xf3\x0f\x1e\xfa\x55\x48\x89\xe5")
-            if rel >= 0:
-                return text.address + lo + rel
+            file_lo = text.file_offset + lo
+            file_hi = text.file_offset + off
+            pos = self.image.data.rfind(b"\x55\x48\x89\xe5", file_lo, file_hi)
+            if pos >= 0:
+                return text.address + (pos - text.file_offset)
+            pos = self.image.data.rfind(b"\xf3\x0f\x1e\xfa\x55\x48\x89\xe5", file_lo, file_hi)
+            if pos >= 0:
+                return text.address + (pos - text.file_offset)
             return None
         step = 4 if self.image.arch == "arm64" else 1
         start = max(self.image.section("__TEXT", "__text").address, address - max_back)
@@ -109,7 +112,7 @@ class Disassembler:
 
     def _find_x64_refs(self, target: int) -> List[int]:
         out = set()
-        text, data = self.image.section_bytes("__TEXT", "__text")
+        text, data = self.image.section_view("__TEXT", "__text")
         rex_pat = re.compile(rb"\x48[\x8d\x8b\x89\x3b\x8a][\x05\x0d\x15\x1d\x25\x2d\x35\x3d](?s:....)")
         for m in rex_pat.finditer(data):
             pos = m.start()
@@ -126,11 +129,11 @@ class Disassembler:
 
     def _find_arm64_refs(self, target: int) -> List[int]:
         out: List[int] = []
-        text, data = self.image.section_bytes("__TEXT", "__text")
+        text, data = self.image.section_view("__TEXT", "__text")
         target_page = target & ~0xFFF
         # Fast hand-decoder for the ADRP + ADD/LDR forms used for cstring references.
         for off in range(0, max(0, len(data) - 48), 4):
-            word = int.from_bytes(data[off : off + 4], "little")
+            word = struct.unpack_from("<I", data, off)[0]
             if word & 0x9F000000 != 0x90000000:
                 continue
             pc = text.address + off
@@ -138,7 +141,7 @@ class Disassembler:
             if page != target_page:
                 continue
             for joff in range(off + 4, min(off + 48, len(data) - 4), 4):
-                w = int.from_bytes(data[joff : joff + 4], "little")
+                w = struct.unpack_from("<I", data, joff)[0]
                 val = _decode_add_or_ldr_address(w, reg, page)
                 if val == target:
                     out.append(pc)

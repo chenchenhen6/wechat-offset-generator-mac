@@ -106,19 +106,24 @@ class MachOImage:
         sec = self.section(segment, name)
         return sec, self.data[sec.file_offset : sec.file_offset + sec.size]
 
+    def section_view(self, segment: str, name: str) -> Tuple[Section, memoryview]:
+        """Return a zero-copy section view for large static-analysis scans."""
+        sec = self.section(segment, name)
+        return sec, memoryview(self.data)[sec.file_offset : sec.file_offset + sec.size]
+
     def find_bytes(self, needle: bytes, sections: Iterable[Section] = None) -> List[int]:
         hay_sections = list(sections) if sections is not None else self.sections
         out: List[int] = []
         for sec in hay_sections:
             if sec.file_offset >= len(self.data):
                 continue
-            blob = self.data[sec.file_offset : min(len(self.data), sec.file_offset + sec.size)]
-            start = 0
+            start = sec.file_offset
+            end = min(len(self.data), sec.file_offset + sec.size)
             while True:
-                idx = blob.find(needle, start)
+                idx = self.data.find(needle, start, end)
                 if idx < 0:
                     break
-                out.append(sec.address + idx)
+                out.append(sec.address + (idx - sec.file_offset))
                 start = idx + 1
         return out
 

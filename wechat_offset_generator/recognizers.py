@@ -1,3 +1,4 @@
+import struct
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
@@ -103,9 +104,78 @@ def recognize_cdp_filter(image: MachOImage) -> Recognition:
     return Recognition(candidates[0], "high", evidence + ["+8 field compared with 6 after CDP filter call"])
 
 
-def recognize_resource_cache_policy(image: MachOImage) -> Optional[Recognition]:
-    # Deliberately conservative: only return a high-confidence result when a full anchor chain is implemented.
-    return None
+def recognize_resource_cache_policy(image: MachOImage) -> Recognition:
+    """Locate the macOS resource cache policy predicate.
+
+    The function is the unique code owner of the exact
+    ``WAPCAdapterAppIndex.js`` string reference.  First hooks its return value
+    and forces it to zero.  We deliberately require both a unique function and
+    a boolean-return idiom so a changed future build fails closed instead of
+    emitting a plausible-looking, unsafe offset.
+    """
+    d = Disassembler(image)
+    anchors = _find_cstrings(image, [b"WAPCAdapterAppIndex.js\0"])
+    evidence: List[str] = []
+    candidates: List[int] = []
+
+    for label, addrs in anchors.items():
+        for saddr in addrs:
+            for ref in d.find_string_references(saddr):
+                entry = d.find_previous_function_entry(ref, 0x5000)
+                if entry is None:
+                    continue
+                candidates.append(entry)
+                evidence.append(
+                    f"{label.rstrip(chr(0))} at 0x{saddr:X} referenced near "
+                    f"0x{ref:X}; function 0x{entry:X}"
+                )
+
+    candidates = sorted(set(candidates))
+    matches = [entry for entry in candidates if _returns_boolean_policy(d, entry)]
+    if len(matches) != 1:
+        raise RecognitionError(
+            "ResourceCachePolicy ambiguous/unresolved: "
+            f"anchored={[hex(c) for c in candidates]}, "
+            f"boolean={[hex(c) for c in matches]}"
+        )
+
+    address = matches[0]
+    return Recognition(
+        address,
+        "high",
+        evidence
+        + [
+            f"unique WAPCAdapterAppIndex.js owner 0x{address:X} returns a boolean cache policy"
+        ],
+    )
+
+
+def _returns_boolean_policy(d: Disassembler, address: int) -> bool:
+    """Recognize the compiler's final pointer-membership-to-bool return."""
+    ins = d.instructions(address, 0x3000)
+    ret_idx = next((idx for idx, i in enumerate(ins) if i.mnemonic == "ret"), None)
+    if ret_idx is None:
+        return False
+    ins = ins[: ret_idx + 1]
+
+    if d.image.arch == "arm64":
+        # Current/known builds end with: cmp x0, #0; cset w0, ne; ...; ret.
+        for idx, i in enumerate(ins):
+            if i.mnemonic != "cset" or not i.op_str.startswith("w0, "):
+                continue
+            if not i.op_str.endswith(("ne", "eq")):
+                continue
+            if any(prev.mnemonic in ("cmp", "tst") for prev in ins[max(0, idx - 2) : idx]):
+                return True
+        return False
+
+    # x86_64 emits test/cmp followed by setne/sete al for the same predicate.
+    for idx, i in enumerate(ins):
+        if i.mnemonic not in ("setne", "sete", "setnz", "setz") or i.op_str != "al":
+            continue
+        if any(prev.mnemonic in ("cmp", "test") for prev in ins[max(0, idx - 3) : idx]):
+            return True
+    return False
 
 
 def _find_cstrings(image: MachOImage, needles: Iterable[bytes]) -> Dict[str, List[int]]:
@@ -114,12 +184,13 @@ def _find_cstrings(image: MachOImage, needles: Iterable[bytes]) -> Dict[str, Lis
     for needle in needles:
         starts: List[int] = []
         for sec in sections:
-            blob = image.data[sec.file_offset : sec.file_offset + sec.size]
-            pos = blob.find(needle)
+            lo = sec.file_offset
+            hi = min(len(image.data), sec.file_offset + sec.size)
+            pos = image.data.find(needle, lo, hi)
             while pos >= 0:
-                start = blob.rfind(b"\0", 0, pos) + 1
-                starts.append(sec.address + start)
-                pos = blob.find(needle, pos + 1)
+                start = image.data.rfind(b"\0", lo, pos) + 1
+                starts.append(sec.address + (start - lo))
+                pos = image.data.find(needle, pos + 1, hi)
         if starts:
             out[needle.decode("utf-8", "replace")] = sorted(set(starts))
     return out
@@ -149,10 +220,10 @@ def _recognize_scene_arm64(image: MachOImage, d: Disassembler) -> SceneRecogniti
 
     # Conservative fallback for builds whose WebSocket string references are not recognized.
     candidates = []
-    text, data = image.section_bytes("__TEXT", "__text")
+    text, data = image.section_view("__TEXT", "__text")
     for off in range(0, len(data) - 4, 4):
         pc = text.address + off
-        word = int.from_bytes(data[off : off + 4], "little")
+        word = struct.unpack_from("<I", data, off)[0]
         # ldr Xt, [x0,#8]
         if (word & 0xFFC00000) != 0xF9400000 or ((word >> 5) & 31) != 0 or ((word >> 10) & 0xFFF) != 1:
             continue
@@ -200,12 +271,13 @@ def _recognize_scene_x64(image: MachOImage, d: Disassembler) -> SceneRecognition
 
     # Conservative fallback for builds whose WebSocket string references are not recognized.
     candidates = []
-    text, data = image.section_bytes("__TEXT", "__text")
+    text, data = image.section_view("__TEXT", "__text")
     pattern = b"\x48\x8b\x7f\x08"  # mov rdi, qword ptr [rdi+8]
-    pos = data.find(pattern)
-    while pos >= 0:
+    file_pos = image.data.find(pattern, text.file_offset, text.end_offset)
+    while file_pos >= 0:
+        pos = file_pos - text.file_offset
         pc = text.address + pos
-        entry = _x64_previous_prologue(text.address, data, pos, 0x80)
+        entry = _x64_previous_prologue(text, image.data, file_pos, 0x80)
         if entry is not None and pc - entry <= 0x50:
             calls = d.direct_calls(entry, 0x80)
             for idx in range(0, len(calls) - 1):
@@ -214,7 +286,7 @@ def _recognize_scene_x64(image: MachOImage, d: Disassembler) -> SceneRecognition
                 if st is not None and sc is not None:
                     candidates.append((entry, st, sc))
                     evidence.append(f"x64 scene caller 0x{entry:X}: [rdi+8], accessor +{st}, scene +{sc}, cmp 1101")
-        pos = data.find(pattern, pos + 1)
+        file_pos = image.data.find(pattern, file_pos + 1, text.end_offset)
     candidates = sorted(set(candidates))
     if len(candidates) != 1:
         raise RecognitionError(f"scene hook ambiguous/unresolved: {candidates[:8]}")
@@ -260,13 +332,12 @@ def _x64_function_loads_rdi_plus_8(d: Disassembler, entry: int) -> bool:
     return False
 
 
-def _x64_previous_prologue(text_address: int, data: bytes, pos: int, max_back: int) -> Optional[int]:
-    lo = max(0, pos - max_back)
-    window = data[lo:pos]
-    rel = window.rfind(b"\x55\x48\x89\xe5")
-    if rel < 0:
+def _x64_previous_prologue(text, data: bytes, file_pos: int, max_back: int) -> Optional[int]:
+    lo = max(text.file_offset, file_pos - max_back)
+    pos = data.rfind(b"\x55\x48\x89\xe5", lo, file_pos)
+    if pos < 0:
         return None
-    return text_address + lo + rel
+    return text.address + (pos - text.file_offset)
 
 
 def _arm_accessor_struct_offset(d: Disassembler, address: int) -> Optional[int]:

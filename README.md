@@ -115,15 +115,18 @@ python3 generate_wechat_offsets.py \
 
 ## 可选字段说明
 
-`ResourceCachePolicyHookOffset` 是可选字段。脚本只有在找到高置信完整证据链时才会写入；否则会省略并继续生成 JSON，避免错误 Hook。
+`ResourceCachePolicyHookOffset` 通过 `WAPCAdapterAppIndex.js` 的唯一代码引用和布尔返回模式识别。为了避免错误 Hook，它和其他核心字段一样，无法获得唯一高置信证据时会终止，不会输出结构不完整的 JSON。
 
-核心字段失败时不会生成 JSON：
+必须完整识别的字段：
 
 - `LoadStartHookOffset`
 - `LoadStartHookOffset2`
 - `StructOffset`
 - `SceneOffset`
+- `ResourceCachePolicyHookOffset`
 - `CDPFilterHookOffset`
+
+脚本按字符串锚点、函数入口、调用链和返回值语义识别偏移，通常可以直接适配安装在本机的不同 WMPF 版本。微信未来如果删除锚点或大幅改写实现，脚本会明确失败而不是猜测地址；此时需要先更新识别规则。
 
 ## 当前示例输出
 
