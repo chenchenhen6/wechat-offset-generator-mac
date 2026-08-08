@@ -18,10 +18,10 @@ class CurrentWeChatRegressionTests(unittest.TestCase):
         scene = recognize_scene_hook(image)
         cache = recognize_resource_cache_policy(image)
 
-        self.assertEqual(scene.address, 0x8DD44B4)
-        self.assertEqual(scene.struct_offset, 0x5A0)
+        self.assertEqual(scene.address, 0x86C6840)
+        self.assertEqual(scene.struct_offset, 0x5A8)
         self.assertEqual(scene.scene_offset, 0x1C8)
-        self.assertEqual(cache.address, 0x3697418)
+        self.assertEqual(cache.address, 0x4BB0F50)
         self.assertEqual(cache.confidence, "high")
 
     def test_x64_resource_cache_policy_is_recognized(self):
@@ -29,7 +29,7 @@ class CurrentWeChatRegressionTests(unittest.TestCase):
 
         cache = recognize_resource_cache_policy(image)
 
-        self.assertEqual(cache.address, 0x3E78770)
+        self.assertEqual(cache.address, 0x53C32E0)
         self.assertEqual(cache.confidence, "high")
 
 

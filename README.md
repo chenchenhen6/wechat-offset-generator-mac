@@ -1,4 +1,4 @@
-# WeChat / First 偏移地址生成器
+# WeChat / First 偏移地址 JSON 生成器
 
 这个文件夹可以拷贝到另一台 macOS 电脑上，用来静态生成 Spade-sec/First 使用的 `addresses.<WMPF版本>.json`。
 

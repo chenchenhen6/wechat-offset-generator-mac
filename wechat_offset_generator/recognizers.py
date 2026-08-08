@@ -21,6 +21,10 @@ def _is_imm(op) -> bool:
     return getattr(op, "type", None) in (CS_OP_IMM, 2)
 
 
+def _is_reg(op) -> bool:
+    return getattr(op, "type", None) in (CS_OP_REG, 1)
+
+
 def recognize_load_start(image: MachOImage) -> Recognition:
     d = Disassembler(image)
     anchors = _find_cstrings(
@@ -151,31 +155,102 @@ def recognize_resource_cache_policy(image: MachOImage) -> Recognition:
 
 
 def _returns_boolean_policy(d: Disassembler, address: int) -> bool:
-    """Recognize the compiler's final pointer-membership-to-bool return."""
+    """Recognize the compiler's pointer-membership-to-bool return."""
     ins = d.instructions(address, 0x3000)
     ret_idx = next((idx for idx, i in enumerate(ins) if i.mnemonic == "ret"), None)
     if ret_idx is None:
         return False
-    ins = ins[: ret_idx + 1]
+    first_return = ins[: ret_idx + 1]
 
     if d.image.arch == "arm64":
         # Current/known builds end with: cmp x0, #0; cset w0, ne; ...; ret.
-        for idx, i in enumerate(ins):
+        for idx, i in enumerate(first_return):
             if i.mnemonic != "cset" or not i.op_str.startswith("w0, "):
                 continue
             if not i.op_str.endswith(("ne", "eq")):
                 continue
-            if any(prev.mnemonic in ("cmp", "tst") for prev in ins[max(0, idx - 2) : idx]):
+            if any(
+                prev.mnemonic in ("cmp", "tst")
+                for prev in first_return[max(0, idx - 2) : idx]
+            ):
                 return True
-        return False
+        return _has_split_boolean_return(d, ins, ret_idx)
 
     # x86_64 emits test/cmp followed by setne/sete al for the same predicate.
-    for idx, i in enumerate(ins):
+    for idx, i in enumerate(first_return):
         if i.mnemonic not in ("setne", "sete", "setnz", "setz") or i.op_str != "al":
             continue
-        if any(prev.mnemonic in ("cmp", "test") for prev in ins[max(0, idx - 3) : idx]):
+        if any(
+            prev.mnemonic in ("cmp", "test")
+            for prev in first_return[max(0, idx - 3) : idx]
+        ):
+            return True
+    return _has_split_boolean_return(d, ins, ret_idx)
+
+
+def _has_split_boolean_return(d: Disassembler, ins: List, ret_idx: int) -> bool:
+    """Recognize true/false blocks split around an early shared epilogue.
+
+    Newer WMPF builds place the false fast path and the first ``ret`` near the
+    function entry, then emit the true path later as a cold block which jumps
+    back into that epilogue.  Only accept the layout when the early path sets
+    the return register to zero and a later direct branch back to the same
+    return block is fed by an explicit one.
+    """
+    first_return = ins[: ret_idx + 1]
+    if not any(_sets_return_constant(d, i, 0) for i in first_return):
+        return False
+
+    epilogue_lo = first_return[0].address
+    epilogue_hi = first_return[-1].address
+    for idx in range(ret_idx + 1, len(ins)):
+        branch = ins[idx]
+        target = _direct_branch_target(branch)
+        if target is None or not epilogue_lo <= target <= epilogue_hi:
+            continue
+        # Allow predicate bookkeeping between assigning true and the branch,
+        # but do not carry the value across another call.
+        lookback_start = max(ret_idx + 1, idx - 5)
+        true_idx = next(
+            (
+                j
+                for j in range(idx - 1, lookback_start - 1, -1)
+                if _sets_return_constant(d, ins[j], 1)
+            ),
+            None,
+        )
+        if true_idx is not None and not any(
+            i.mnemonic in ("bl", "blr", "call") for i in ins[true_idx + 1 : idx]
+        ):
             return True
     return False
+
+
+def _sets_return_constant(d: Disassembler, ins, value: int) -> bool:
+    if ins.mnemonic == "mov" and len(ins.operands) >= 2:
+        dst, src = ins.operands[:2]
+        if _is_reg(dst) and _is_imm(src):
+            name = ins.reg_name(dst.reg)
+            return name in (
+                ("w0",) if d.image.arch == "arm64" else ("al", "eax", "rax")
+            ) and int(src.imm) == value
+
+    if value == 0 and d.image.arch == "x64" and ins.mnemonic in ("xor", "sub"):
+        if len(ins.operands) < 2 or not all(_is_reg(op) for op in ins.operands[:2]):
+            return False
+        left, right = ins.operands[:2]
+        return left.reg == right.reg and ins.reg_name(left.reg) in ("al", "eax", "rax")
+    return False
+
+
+def _direct_branch_target(ins) -> Optional[int]:
+    branch = ins.mnemonic == "b" or ins.mnemonic.startswith("b.")
+    branch = branch or ins.mnemonic in ("cbz", "cbnz", "tbz", "tbnz", "jmp")
+    branch = branch or (ins.mnemonic.startswith("j") and ins.mnemonic != "jmp")
+    if not branch or not ins.operands:
+        return None
+    op = ins.operands[-1]
+    return int(op.imm) if _is_imm(op) else None
 
 
 def _find_cstrings(image: MachOImage, needles: Iterable[bytes]) -> Dict[str, List[int]]:
